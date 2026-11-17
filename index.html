@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Space Dodger v4</title>
+</head>
+<body style="margin:0;background:#000;display:grid;place-items:center;height:100vh;overflow:hidden">
+  <canvas id="c"></canvas>
+  <script>
+    // v4: particle explosions, difficulty ramp (5% after 100, cap 1.20x),
+    //     top-10 high scores with date/time (localStorage), engine trail
+    // v3: starfield, sound effects, viewport-sized canvas, start screen
+    // v2: bullets, multiple obstacle types, score display
+    // v1: basic ship movement + single obstacle type
+
+    const c = document.getElementById('c'), ctx = c.getContext('2d');
+    c.width = innerWidth;
+    c.height = innerHeight;
+
+    // --- State ---
+    let ship = { x: c.width / 2 - 20, y: c.height - 65, w: 40, h: 40 };
+    let obstacles = [];
+    let bullets = [];
+    let particles = [];
+    let score = 0;
+    let gameOver = false;
+    let started = false;
+    let keys = {};
+    let fireCooldown = 0;
+
+    // --- High Scores (top 10, all-time, with date/time) ---
+    let highScores = JSON.parse(localStorage.getItem('sd_highscores') || '[]');
+
+    function saveScore() {
+      if (score <= 0) return;
+      const d = new Date();
+      const date = `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+      highScores.push({ score, date });
+      highScores.sort((a, b) => b.score - a.score);
+      highScores = highScores.slice(0, 10);
+      localStorage.setItem('sd_highscores', JSON.stringify(highScores));
+    }
+
+    function drawHighScores() {
+      ctx.fillStyle = '#fff';
+      ctx.font = '14px monospace';
+      const hsX = c.width / 2 - 160;
+      ctx.fillText('High Scores:', hsX, c.height / 2 + 40);
+      highScores.forEach((e, i) => {
+        const col = Math.floor(i / 5);
+        const row = i % 5;
+        const x = hsX + col * 200;
+        ctx.fillText(`${i + 1}. ${e.score}  ${e.date}`, x, c.height / 2 + 58 + row * 17);
+      });
+    }
+
+    // --- Obstacle types ---
+    const TYPES = [
+      { size: 18, hp: 1, color: '#f80', points: 1 },
+      { size: 28, hp: 2, color: '#f55', points: 2 },
+      { size: 40, hp: 3, color: '#f22', points: 3 }
+    ];
+
+    // --- Difficulty ramp: flat until 100, then 5% boost with gentle creep, cap 1.20x ---
+    function difficulty() {
+      if (score < 100) return 1.0;
+      return 1.05 + Math.min((score - 100) * 0.0005, 0.15);
+    }
+
+    // --- Starfield ---
+    const starCanvas = document.createElement('canvas');
+    starCanvas.width = c.width;
+    starCanvas.height = c.height;
+    const sctx = starCanvas.getContext('2d');
+    sctx.fillStyle = '#000';
+    sctx.fillRect(0, 0, starCanvas.width, starCanvas.height);
+    for (let i = 0; i < 120; i++) {
+      const x = Math.random() * starCanvas.width;
+      const y = Math.random() * starCanvas.height;
+      const r = Math.random() * 1.2 + 0.3;
+      const brightness = Math.random() * 128 + 128;
+      sctx.fillStyle = `rgb(${brightness},${brightness},${brightness})`;
+      sctx.fillRect(x, y, r, r);
+    }
+    let starOffset = 0;
+    const STAR_SPEED = 0.3;
+
+    // --- Sound ---
+    const audioCtx = new AudioContext();
+    function playSound(freq, duration, type = 'square', volume = 0.15) {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      gain.gain.value = volume;
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + duration);
+    }
+    const sfx = {
+      fire:     () => playSound(880, 0.08, 'square', 0.1),
+      hit:      () => playSound(220, 0.1, 'sawtooth', 0.12),
+      destroy:  () => playSound(110, 0.2, 'sawtooth', 0.15),
+      gameOver: () => playSound(60, 0.5, 'sawtooth', 0.2)
+    };
+
+    // --- Particles ---
+    function explode(x, y, color) {
+      for (let i = 0; i < 14; i++) {
+        particles.push({
+          x, y,
+          vx: (Math.random() - 0.5) * 7,
+          vy: (Math.random() - 0.5) * 7,
+          life: 25 + Math.random() * 20,
+          maxLife: 45,
+          color
+        });
+      }
+    }
+
+    // --- Input ---
+    addEventListener('keydown', e => {
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      if (!started) { started = true; spawn(); return; }
+      keys[e.key] = true;
+      if (e.key === ' ') e.preventDefault();
+    });
+    addEventListener('keyup', e => keys[e.key] = false);
+
+    // --- Spawn ---
+    function spawn() {
+      if (gameOver) return;
+      const t = TYPES[Math.floor(Math.random() * TYPES.length)];
+      const d = difficulty();
+      obstacles.push({
+        x: Math.random() * (c.width - t.size),
+        y: -t.size,
+        size: t.size,
+        hp: t.hp,
+        color: t.color,
+        points: t.points,
+        speed: (0.8 + Math.random() * 1.2 + t.size / 30) * d
+      });
+      setTimeout(spawn, (360 + Math.random() * 600) / d);
+    }
+
+    // --- Collision ---
+    function hit(a, b) {
+      return a.x < b.x + b.size && a.x + a.w > b.x &&
+             a.y < b.y + b.size && a.y + a.h > b.y;
+    }
+
+    // --- Game loop ---
+    function loop() {
+      // Starfield
+      starOffset = (starOffset + STAR_SPEED) % starCanvas.height;
+      ctx.drawImage(starCanvas, 0, starOffset - starCanvas.height);
+      ctx.drawImage(starCanvas, 0, starOffset);
+
+      // Start screen
+      if (!started) {
+        ctx.fillStyle = '#fff'; ctx.font = '28px monospace';
+        ctx.fillText('SPACE DODGER', c.width / 2 - 90, c.height / 2 - 40);
+        ctx.font = '14px monospace';
+        ctx.fillText('Press any key to start', c.width / 2 - 80, c.height / 2);
+        drawHighScores();
+        requestAnimationFrame(loop);
+        return;
+      }
+
+      // Game Over screen
+      if (gameOver) {
+        ctx.fillStyle = '#fff'; ctx.font = '22px monospace';
+        ctx.fillText('GAME OVER  Score: ' + score, c.width / 2 - 80, c.height / 2 - 50);
+        ctx.font = '14px monospace';
+        ctx.fillText('Press R to restart', c.width / 2 - 60, c.height / 2 - 20);
+        drawHighScores();
+        if (keys['r'] || keys['R']) location.reload();
+        return;
+      }
+
+      // Ship movement
+      if (keys['ArrowLeft'])  ship.x = Math.max(0, ship.x - 4);
+      if (keys['ArrowRight']) ship.x = Math.min(c.width - ship.w, ship.x + 4);
+
+      // Fire
+      if (fireCooldown > 0) fireCooldown--;
+      if (keys[' '] && fireCooldown === 0) {
+        bullets.push({ x: ship.x + ship.w / 2 - 3, y: ship.y, w: 6, h: 14 });
+        fireCooldown = 12;
+        sfx.fire();
+      }
+
+      // Draw ship
+      ctx.fillStyle = '#0f0';
+      ctx.beginPath();
+      ctx.moveTo(ship.x + ship.w / 2, ship.y);
+      ctx.lineTo(ship.x, ship.y + ship.h);
+      ctx.lineTo(ship.x + ship.w, ship.y + ship.h);
+      ctx.fill();
+
+      // Engine trail
+      const flicker = Math.random() * 5;
+      ctx.fillStyle = '#f80';
+      ctx.beginPath();
+      ctx.moveTo(ship.x + ship.w / 2 - 5, ship.y + ship.h);
+      ctx.lineTo(ship.x + ship.w / 2, ship.y + ship.h + 10 + flicker);
+      ctx.lineTo(ship.x + ship.w / 2 + 5, ship.y + ship.h);
+      ctx.fill();
+      ctx.fillStyle = '#ff0';
+      ctx.beginPath();
+      ctx.moveTo(ship.x + ship.w / 2 - 2, ship.y + ship.h);
+      ctx.lineTo(ship.x + ship.w / 2, ship.y + ship.h + 5 + flicker * 0.5);
+      ctx.lineTo(ship.x + ship.w / 2 + 2, ship.y + ship.h);
+      ctx.fill();
+
+      // Update & draw bullets
+      for (let i = bullets.length - 1; i >= 0; i--) {
+        const b = bullets[i];
+        b.y -= 10;
+        ctx.fillStyle = '#ff0';
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+        if (b.y + b.h < 0) bullets.splice(i, 1);
+      }
+
+      // Update & draw obstacles
+      for (let i = obstacles.length - 1; i >= 0; i--) {
+        const o = obstacles[i];
+        o.y += o.speed;
+
+        // Bullet collisions
+        for (let j = bullets.length - 1; j >= 0; j--) {
+          const b = bullets[j];
+          if (hit(b, o)) {
+            bullets.splice(j, 1);
+            o.hp--;
+            sfx.hit();
+            if (o.hp <= 0) {
+              score += o.points;
+              sfx.destroy();
+              explode(o.x + o.size / 2, o.y + o.size / 2, o.color);
+              obstacles.splice(i, 1);
+              break;
+            }
+          }
+        }
+        if (!obstacles[i]) continue;
+
+        // Draw obstacle (flash white when damaged)
+        const maxHp = TYPES.find(t => t.size === o.size).hp;
+        ctx.fillStyle = o.hp < maxHp ? '#fff' : o.color;
+        ctx.fillRect(o.x, o.y, o.size, o.size);
+
+        // Ship collision
+        if (hit(ship, o)) {
+          gameOver = true;
+          sfx.gameOver();
+          saveScore();
+        }
+
+        // Off-screen cleanup
+        if (o.y > c.height) obstacles.splice(i, 1);
+      }
+
+      // Update & draw particles
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life--;
+        ctx.globalAlpha = p.life / p.maxLife;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x, p.y, 3, 3);
+        if (p.life <= 0) particles.splice(i, 1);
+      }
+      ctx.globalAlpha = 1;
+
+      // Score display
+      ctx.fillStyle = '#fff'; ctx.font = '16px monospace';
+      ctx.fillText('Score: ' + score, 10, 24);
+
+      requestAnimationFrame(loop);
+    }
+
+    loop();
+  </script>
+</body>
+</html>   
