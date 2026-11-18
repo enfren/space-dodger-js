@@ -4,7 +4,7 @@ A 2D space shooter built with vanilla JavaScript and HTML5 Canvas. No dependenci
 
 ## Play
 
-[Live Demo](https://enfren.github.io/vanilla-js-space-dodger/)
+[Live Demo](https://enfren.github.io/space-dodger-js/)
 
 ## Screenshots
 
